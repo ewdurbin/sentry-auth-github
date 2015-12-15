@@ -2,6 +2,7 @@ from __future__ import absolute_import, print_function
 
 from django import forms
 from sentry.auth.view import AuthView, ConfigureView
+from sentry.models import AuthIdentity
 
 from .client import GitHubClient
 from .constants import ERR_NO_ORG_ACCESS
@@ -10,6 +11,15 @@ from .constants import (
     ERR_NO_SINGLE_VERIFIED_PRIMARY_EMAIL, ERR_NO_SINGLE_PRIMARY_EMAIL,
     ERR_NO_VERIFIED_PRIMARY_EMAIL, ERR_NO_PRIMARY_EMAIL,
 )
+
+
+def _get_name_from_email(email):
+    """
+    Given an email return a capitalized name. Ex. john.smith@example.com would return John Smith.
+    """
+    name = email.rsplit('@', 1)[0]
+    name = ' '.join([n_part.capitalize() for n_part in name.split('.')])
+    return name
 
 
 class FetchUser(AuthView):
@@ -29,7 +39,11 @@ class FetchUser(AuthView):
 
         if not user.get('email'):
             emails = self.client.get_user_emails(access_token)
-            email = [e['email'] for e in emails if ((not REQUIRE_VERIFIED_EMAIL) | e['verified']) and e['primary']]
+            email = [
+                e['email'] for e in emails
+                if ((not REQUIRE_VERIFIED_EMAIL) | e['verified'])
+                and e['primary']
+            ]
             if len(email) == 0:
                 if REQUIRE_VERIFIED_EMAIL:
                     msg = ERR_NO_VERIFIED_PRIMARY_EMAIL
@@ -45,10 +59,48 @@ class FetchUser(AuthView):
             else:
                 user['email'] = email[0]
 
+        # A user hasn't set their name in their Github profile so it isn't
+        # populated in the response
+        if not user.get('name'):
+            user['name'] = _get_name_from_email(user['email'])
+
         helper.bind_state('user', user)
 
         return helper.next_step()
 
+
+class ConfirmEmailForm(forms.Form):
+    email = forms.EmailField(label='Email')
+
+
+class ConfirmEmail(AuthView):
+    def handle(self, request, helper):
+        user = helper.fetch_state('user')
+
+        # TODO(dcramer): this isnt ideal, but our current flow doesnt really
+        # support this behavior;
+        try:
+            auth_identity = AuthIdentity.objects.select_related('user').get(
+                auth_provider=helper.auth_provider,
+                ident=user['id'],
+            )
+        except AuthIdentity.DoesNotExist:
+            pass
+        else:
+            user['email'] = auth_identity.user.email
+
+        if user.get('email'):
+            return helper.next_step()
+
+        form = ConfirmEmailForm(request.POST or None)
+        if form.is_valid():
+            user['email'] = form.cleaned_data['email']
+            helper.bind_state('user', user)
+            return helper.next_step()
+
+        return self.respond('sentry_auth_github/enter-email.html', {
+            'form': form,
+        })
 
 class SelectOrganizationForm(forms.Form):
     org = forms.ChoiceField(label='Organization')
